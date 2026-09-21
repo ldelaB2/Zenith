@@ -86,6 +86,21 @@ struct RotationEstimatorOptions {
   // after solving, then recompute active set.
   double max_rotation_error_deg = 10.0;
 
+  // If true, the IRLS stage treats every relative rotation constraint as
+  // ambiguous up to a 180 degree rotation about the camera optical (z) axis:
+  // for each constraint, the residual is evaluated with and without the flip
+  // applied to the measured cam2_from_cam1 and the smaller one is used
+  // ("snapping"). For gravity-aligned 1-DOF constraints the yaw residual is
+  // wrapped to a period of π instead of 2π. The L1 stage, the spanning tree
+  // initialization, and the post-solve rotation error filter always use the
+  // raw measurements, so pairs that are only consistent under the flip are
+  // still invalidated after solving (their matches are the ambiguous ones).
+  // Intended for nadir aerial imagery of visually symmetric scenes (e.g., crop
+  // rows flown in a lawnmower pattern), where two-view geometry frequently
+  // returns a yaw-flipped relative rotation that otherwise drags the solution
+  // between the two yaw basins and splits the pose graph into two components.
+  bool use_180_degree_flip_snap = false;
+
   // When false, treat each non-ref sensor's cam_from_rig rotation as a
   // pre-calibrated constant
   bool refine_sensor_from_rig = true;

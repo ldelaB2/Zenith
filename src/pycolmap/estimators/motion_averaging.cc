@@ -250,6 +250,13 @@ void BindRotationEstimator(py::module& m) {
               "Filter pairs with rotation error exceeding this threshold "
               "(degrees).")
           .def_readwrite(
+              "use_180_degree_flip_snap",
+              &RotationEstimatorOptions::use_180_degree_flip_snap,
+              "In the IRLS stage only, treat relative rotations as ambiguous "
+              "up to a 180 degree flip about the camera optical axis and snap "
+              "each residual to the closer hypothesis. For nadir aerial "
+              "imagery of visually symmetric scenes.")
+          .def_readwrite(
               "refine_sensor_from_rig",
               &RotationEstimatorOptions::refine_sensor_from_rig,
               "When False, treat each non-ref sensor's cam_from_rig as a "

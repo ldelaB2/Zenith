@@ -328,6 +328,9 @@ class GlobalMapperRotationAveragingOptionsWidget : public OptionsWidget {
     AddOptionDouble(&options->global_mapper->mapper.rotation_averaging
                          .max_rotation_error_deg,
                     "max_rotation_error [deg]");
+    AddOptionBool(&options->global_mapper->mapper.rotation_averaging
+                       .use_180_degree_flip_snap,
+                  "use_180_degree_flip_snap");
   }
 };
 

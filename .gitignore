@@ -26,6 +26,9 @@ doc/_static/viewer/
 doc/test-results/
 vcpkg_installed/
 
+# Dev container
+.devcontainer/
+
 # Compiled Object files
 *.slo
 *.lo

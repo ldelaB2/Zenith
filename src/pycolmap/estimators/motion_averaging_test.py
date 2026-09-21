@@ -29,6 +29,13 @@ def test_rotation_estimator_options_default_init() -> None:
     options = pycolmap.RotationEstimatorOptions()
     assert options is not None
     assert options.reweighting == pycolmap.RotationAveragingReweighting.UNIFORM
+    assert options.use_180_degree_flip_snap is False
+
+
+def test_rotation_estimator_options_flip_snap_readwrite() -> None:
+    options = pycolmap.RotationEstimatorOptions()
+    options.use_180_degree_flip_snap = True
+    assert options.use_180_degree_flip_snap is True
 
 
 def test_rotation_estimator_options_reweighting_readwrite() -> None:

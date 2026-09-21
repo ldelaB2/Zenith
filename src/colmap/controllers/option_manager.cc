@@ -912,6 +912,9 @@ void OptionManager::AddGlobalMapperOptions() {
   AddDefaultOption(
       "GlobalMapper.ra_max_rotation_error_deg",
       &global_mapper->mapper.rotation_averaging.max_rotation_error_deg);
+  AddDefaultOption(
+      "GlobalMapper.ra_use_180_degree_flip_snap",
+      &global_mapper->mapper.rotation_averaging.use_180_degree_flip_snap);
   AddDefaultEnumOption("GlobalMapper.ra_reweighting",
                        &global_mapper->mapper.rotation_averaging.reweighting,
                        RotationAveragingReweightingToString,

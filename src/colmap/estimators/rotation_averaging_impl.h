@@ -27,6 +27,11 @@ class RotationAveragingProblem {
   // 3-DOF constraint for general case (no gravity or partial gravity).
   struct Full3DOF {
     Eigen::Matrix3d R_cam2_from_cam1;
+    // Rz(pi) * R_cam2_from_cam1, i.e., the measured relative rotation with a
+    // 180 degree flip about cam2's optical axis, with the same gravity
+    // alignment applied. Only populated when use_180_degree_flip_snap is set
+    // and only evaluated by ComputeResiduals(/*snap_180_degree_flips=*/true).
+    std::optional<Eigen::Matrix3d> R_cam2_from_cam1_flipped;
   };
 
   // Preprocessed constraint for an image pair, built once during setup.
@@ -47,8 +52,18 @@ class RotationAveragingProblem {
                            const FlatHashSet<image_t>& active_image_ids,
                            Reconstruction& reconstruction);
 
-  // Computes residual vector b from current rotation estimates.
-  void ComputeResiduals();
+  // Computes residual vector b from current rotation estimates. If
+  // snap_180_degree_flips is true (and use_180_degree_flip_snap is set), each
+  // constraint uses the smaller of its raw and 180 degree yaw-flipped
+  // residual; see RotationEstimatorOptions::use_180_degree_flip_snap.
+  void ComputeResiduals(bool snap_180_degree_flips = false);
+
+  // Flips the orientation of every frame (by 180 degrees about its z-axis)
+  // whose constraints have a smaller total raw residual norm when flipped,
+  // i.e., frames that ended up in the wrong yaw basin relative to the
+  // majority of their neighbors. Requires use_180_degree_flip_snap. Returns
+  // the number of flipped frames.
+  int SnapFlippedFrames();
 
   // Updates rotation estimates by applying the solution step.
   void UpdateState(const Eigen::VectorXd& step);
@@ -80,10 +95,23 @@ class RotationAveragingProblem {
   const NodeHashMap<image_pair_t, PairConstraint>& PairConstraints() const {
     return pair_constraints_;
   }
+  // Number of 3-DOF constraints that selected the 180 degree flipped
+  // hypothesis in the most recent ComputeResiduals call.
+  int NumSnappedConstraints() const { return num_snapped_constraints_; }
 
  private:
   // Returns true if frame has gravity prior and gravity mode is enabled.
   bool HasFrameGravity(frame_t frame_id) const;
+
+  // Residual of a single constraint for the current rotation estimates. For
+  // 1-DOF constraints only the first component is set. If
+  // use_flipped_measurement is true, the 180 degree yaw-flipped measurement
+  // is used instead (requires use_180_degree_flip_snap).
+  Eigen::Vector3d ComputeConstraintResidual(const PairConstraint& constraint,
+                                            bool use_flipped_measurement) const;
+
+  // Rotates the frame's estimated rotation by 180 degrees about its z-axis.
+  void FlipFrameState(frame_t frame_id);
 
   // Allocates parameter indices for frames and cameras, initializes rotations.
   size_t AllocateParameters(const Reconstruction& reconstruction);
@@ -121,6 +149,11 @@ class RotationAveragingProblem {
 
   // Preprocessed constraints for each image pair.
   NodeHashMap<image_pair_t, PairConstraint> pair_constraints_;
+
+  // State for 180 degree flip snapping (only populated when enabled).
+  int num_snapped_constraints_ = 0;
+  std::vector<frame_t> snap_frame_ids_;
+  NodeHashMap<frame_t, std::vector<image_pair_t>> frame_to_pair_ids_;
 
   // Gauge fixing (removes rotational ambiguity).
   frame_t fixed_frame_id_ = kInvalidFrameId;

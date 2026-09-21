@@ -10,6 +10,7 @@
 #include "colmap/scene/synthetic.h"
 #include "colmap/util/hash_containers.h"
 
+#include <algorithm>
 #include <map>
 #include <utility>
 
@@ -130,6 +131,91 @@ void RunAndVerifyRotationAveraging(const Reconstruction& gt_reconstruction,
     ExpectEqualRotations(
         gt_reconstruction, reconstruction_copy, max_rotation_error_deg);
   }
+}
+
+size_t NumValidEdges(const PoseGraph& pose_graph) {
+  size_t num_valid = 0;
+  for (const auto& [pair_id, edge] : pose_graph.Edges()) {
+    if (edge.valid) {
+      ++num_valid;
+    }
+  }
+  return num_valid;
+}
+
+// 180 degree rotation about the camera optical (z) axis.
+Eigen::Quaterniond RzPi() {
+  return Eigen::Quaterniond(
+      Eigen::AngleAxisd(EIGEN_PI, Eigen::Vector3d::UnitZ()));
+}
+
+// Rewrites the synthetic ground truth into a nadir lawnmower survey: all
+// cameras look straight down (-Z in world), consecutive strips alternate
+// heading by 180 degrees, and every pose graph edge is recomputed from the
+// new ground truth. Returns the strip index of each image.
+NodeHashMap<image_t, int> MakeNadirLawnmower(int num_strips,
+                                             int frames_per_strip,
+                                             TestData& data) {
+  std::vector<image_t> image_ids = data.gt_reconstruction.RegImageIds();
+  std::sort(image_ids.begin(), image_ids.end());
+  THROW_CHECK_EQ(static_cast<int>(image_ids.size()),
+                 num_strips * frames_per_strip);
+
+  // cam_from_world for a nadir camera: camera z (optical axis) = world -Z.
+  const Eigen::Quaterniond nadir(
+      Eigen::AngleAxisd(EIGEN_PI, Eigen::Vector3d::UnitX()));
+
+  NodeHashMap<image_t, int> image_to_strip;
+  for (size_t i = 0; i < image_ids.size(); ++i) {
+    const int strip = static_cast<int>(i) / frames_per_strip;
+    const int along = static_cast<int>(i) % frames_per_strip;
+    const double yaw = (strip % 2 == 0) ? 0.0 : EIGEN_PI;
+    const Eigen::Quaterniond cam_from_world =
+        Eigen::Quaterniond(Eigen::AngleAxisd(yaw, Eigen::Vector3d::UnitZ())) *
+        nadir;
+    const Eigen::Vector3d position(along, strip, 10.0);
+    const Rigid3d world_from_cam(cam_from_world.inverse(), position);
+    const image_t image_id = image_ids[i];
+    const frame_t frame_id = data.gt_reconstruction.Image(image_id).FrameId();
+    data.gt_reconstruction.Frame(frame_id).SetRigFromWorld(
+        Inverse(world_from_cam));
+    image_to_strip[image_id] = strip;
+  }
+
+  for (auto& [pair_id, edge] : data.pose_graph.Edges()) {
+    const auto [image_id1, image_id2] = PairIdToImagePair(pair_id);
+    edge.cam2_from_cam1 =
+        data.gt_reconstruction.Image(image_id2).CamFromWorld() *
+        Inverse(data.gt_reconstruction.Image(image_id1).CamFromWorld());
+  }
+
+  return image_to_strip;
+}
+
+// Maximum relative rotation error (degrees) over all registered image pairs,
+// where the computed relative rotation is compared with the ground truth up
+// to a 180 degree flip about the optical axis of either camera.
+double MaxRelativeRotationErrorModuloFlipDeg(const Reconstruction& gt,
+                                             const Reconstruction& computed) {
+  const Eigen::Quaterniond rz_pi = RzPi();
+  const std::vector<image_t> reg_image_ids = computed.RegImageIds();
+  double max_error_rad = 0;
+  for (size_t i = 0; i < reg_image_ids.size(); i++) {
+    for (size_t j = 0; j < i; j++) {
+      const Eigen::Quaterniond rel =
+          computed.Image(reg_image_ids[j]).CamFromWorld().rotation() *
+          computed.Image(reg_image_ids[i]).CamFromWorld().rotation().inverse();
+      const Eigen::Quaterniond rel_gt =
+          gt.Image(reg_image_ids[j]).CamFromWorld().rotation() *
+          gt.Image(reg_image_ids[i]).CamFromWorld().rotation().inverse();
+      const double error_rad =
+          std::min({rel.angularDistance(rel_gt),
+                    rel.angularDistance(rz_pi * rel_gt),
+                    rel.angularDistance(rel_gt * rz_pi)});
+      max_error_rad = std::max(max_error_rad, error_rad);
+    }
+  }
+  return RadToDeg(max_error_rad);
 }
 
 TEST(RotationAveraging, WithoutNoise) {
@@ -660,6 +746,210 @@ TEST(RotationAveraging, RefineSensorFromRigFalsePreservesRig) {
       EXPECT_EQ(*sensor_from_rig_after, sensor_from_rig_before)
           << "rig_id=" << rig_id << ", sensor_id=" << sensor_id.id;
     }
+  }
+}
+
+// Synthetic nadir lawnmower survey where every other cross-strip edge is
+// flipped by 180 degrees about the optical axis, emulating the yaw ambiguity of
+// symmetric crop rows: neither the flipped nor the unflipped cross-strip edges
+// form a consistent majority.
+struct LawnmowerFlipTestData {
+  TestData data;
+  NodeHashMap<image_t, int> image_to_strip;
+  int num_cross_edges = 0;
+  int num_flipped_edges = 0;
+};
+
+LawnmowerFlipTestData CreateLawnmowerFlipTestData() {
+  constexpr int kNumStrips = 2;
+  constexpr int kFramesPerStrip = 6;
+
+  SyntheticDatasetOptions synthetic_dataset_options;
+  synthetic_dataset_options.num_rigs = 1;
+  synthetic_dataset_options.num_cameras_per_rig = 1;
+  synthetic_dataset_options.num_frames_per_rig = kNumStrips * kFramesPerStrip;
+  synthetic_dataset_options.num_points3D = 100;
+  synthetic_dataset_options.prior_gravity = false;
+  synthetic_dataset_options.two_view_geometry_has_relative_pose = true;
+
+  LawnmowerFlipTestData test_data;
+  test_data.data = CreateTestData(synthetic_dataset_options);
+  test_data.image_to_strip =
+      MakeNadirLawnmower(kNumStrips, kFramesPerStrip, test_data.data);
+
+  for (auto& [pair_id, edge] : test_data.data.pose_graph.Edges()) {
+    const auto [image_id1, image_id2] = PairIdToImagePair(pair_id);
+    if (test_data.image_to_strip.at(image_id1) ==
+        test_data.image_to_strip.at(image_id2)) {
+      continue;
+    }
+    ++test_data.num_cross_edges;
+    // Flip by image id parity so that every frame sees a mix of flipped and
+    // unflipped cross-strip edges (a flip pattern correlated with a frame
+    // would legitimately describe that frame as yaw-flipped).
+    if ((image_id1 + image_id2) % 2 == 0) {
+      edge.cam2_from_cam1.rotation() =
+          RzPi() * Eigen::Quaterniond(edge.cam2_from_cam1.rotation());
+      ++test_data.num_flipped_edges;
+    }
+  }
+  THROW_CHECK_GT(test_data.num_flipped_edges, 0);
+  return test_data;
+}
+
+// Expectations for a solve with snapping on the lawnmower data: no frame is
+// de-registered, rotations are recovered up to the (physically unobservable)
+// per-strip yaw flip, and the post-solve filter only removes the cross-strip
+// edges that disagree with the chosen yaw basin.
+void ExpectLawnmowerFlipsResolved(const LawnmowerFlipTestData& test_data,
+                                  const Reconstruction& reconstruction,
+                                  const PoseGraph& pose_graph) {
+  const TestData& data = test_data.data;
+  EXPECT_EQ(reconstruction.NumRegFrames(),
+            data.gt_reconstruction.NumRegFrames());
+  EXPECT_LT(MaxRelativeRotationErrorModuloFlipDeg(data.gt_reconstruction,
+                                                  reconstruction),
+            1e-2);
+  int num_invalid_cross = 0;
+  for (const auto& [pair_id, edge] : pose_graph.Edges()) {
+    if (edge.valid) continue;
+    const auto [image_id1, image_id2] = PairIdToImagePair(pair_id);
+    EXPECT_NE(test_data.image_to_strip.at(image_id1),
+              test_data.image_to_strip.at(image_id2))
+        << "Within-strip edge was invalidated";
+    ++num_invalid_cross;
+  }
+  // Exactly the half of the cross-strip edges inconsistent with the chosen
+  // basin is removed.
+  EXPECT_EQ(num_invalid_cross,
+            test_data.num_cross_edges - test_data.num_flipped_edges);
+}
+
+TEST(RotationAveraging, FlipSnapRecoversYawFlippedCrossStripEdges) {
+  const LawnmowerFlipTestData test_data = CreateLawnmowerFlipTestData();
+  const TestData& data = test_data.data;
+
+  const auto run = [&](bool use_180_degree_flip_snap,
+                       Reconstruction& reconstruction) {
+    PoseGraph pose_graph = data.pose_graph;
+    RotationEstimatorOptions options =
+        CreateRATestOptions(/*use_gravity=*/false);
+    options.random_seed = 0;
+    options.use_180_degree_flip_snap = use_180_degree_flip_snap;
+    reconstruction = data.reconstruction;
+    EXPECT_TRUE(RunRotationAveraging(
+        options, pose_graph, reconstruction, data.pose_priors));
+    return pose_graph;
+  };
+
+  Reconstruction recon_snap;
+  const PoseGraph pose_graph_snap =
+      run(/*use_180_degree_flip_snap=*/true, recon_snap);
+  ExpectLawnmowerFlipsResolved(test_data, recon_snap, pose_graph_snap);
+
+  // Without snapping, the mixed cross-strip edges drag the plain robust solve
+  // between the two yaw basins: within-strip edges get filtered and frames
+  // outside the largest remaining component are de-registered (the "split
+  // into two orientation submodels" failure mode). Snapping is never worse.
+  Reconstruction recon_no_snap;
+  const PoseGraph pose_graph_no_snap =
+      run(/*use_180_degree_flip_snap=*/false, recon_no_snap);
+  EXPECT_GE(recon_snap.NumRegFrames(), recon_no_snap.NumRegFrames());
+  EXPECT_GE(NumValidEdges(pose_graph_snap), NumValidEdges(pose_graph_no_snap));
+}
+
+// Starting IRLS from the identity without the L1 stage guarantees that the
+// unflipped cross-strip edges are ~180 degrees from the current estimate, so
+// the snapping is exercised.
+TEST(RotationAveraging, FlipSnapFromIdentityInitialization) {
+  const LawnmowerFlipTestData test_data = CreateLawnmowerFlipTestData();
+  const TestData& data = test_data.data;
+
+  Reconstruction reconstruction = data.reconstruction;
+  PoseGraph pose_graph = data.pose_graph;
+  RotationEstimatorOptions options = CreateRATestOptions(/*use_gravity=*/false);
+  options.random_seed = 0;
+  options.skip_initialization = true;
+  options.max_num_l1_iterations = 0;
+  options.use_180_degree_flip_snap = true;
+  EXPECT_TRUE(RunRotationAveraging(
+      options, pose_graph, reconstruction, data.pose_priors));
+  ExpectLawnmowerFlipsResolved(test_data, reconstruction, pose_graph);
+}
+
+// A consistent (unflipped) lawnmower graph whose initial orientations have
+// half of the second strip yaw-flipped. Starting IRLS from that torn state,
+// the frame-level snapping must flip those frames back so that the ground
+// truth is recovered exactly and no edge is filtered.
+TEST(RotationAveraging, FlipSnapRepairsTornInitialization) {
+  constexpr int kNumStrips = 2;
+  constexpr int kFramesPerStrip = 6;
+
+  SyntheticDatasetOptions synthetic_dataset_options;
+  synthetic_dataset_options.num_rigs = 1;
+  synthetic_dataset_options.num_cameras_per_rig = 1;
+  synthetic_dataset_options.num_frames_per_rig = kNumStrips * kFramesPerStrip;
+  synthetic_dataset_options.num_points3D = 100;
+  synthetic_dataset_options.prior_gravity = false;
+  synthetic_dataset_options.two_view_geometry_has_relative_pose = true;
+  auto data = CreateTestData(synthetic_dataset_options);
+  const NodeHashMap<image_t, int> image_to_strip =
+      MakeNadirLawnmower(kNumStrips, kFramesPerStrip, data);
+
+  // Initialize from the ground truth with every other frame of the second
+  // strip flipped by 180 degrees about its optical axis.
+  int num_torn = 0;
+  for (const auto& [image_id, strip] : image_to_strip) {
+    const frame_t frame_id = data.gt_reconstruction.Image(image_id).FrameId();
+    Rigid3d rig_from_world =
+        data.gt_reconstruction.Frame(frame_id).RigFromWorld();
+    if (strip == 1 && image_id % 2 == 0) {
+      rig_from_world.rotation() =
+          RzPi() * Eigen::Quaterniond(rig_from_world.rotation());
+      ++num_torn;
+    }
+    data.reconstruction.Frame(frame_id).SetRigFromWorld(rig_from_world);
+  }
+  ASSERT_GT(num_torn, 0);
+
+  Reconstruction reconstruction = data.reconstruction;
+  PoseGraph pose_graph = data.pose_graph;
+  RotationEstimatorOptions options = CreateRATestOptions(/*use_gravity=*/false);
+  options.random_seed = 0;
+  options.skip_initialization = true;
+  options.max_num_l1_iterations = 0;
+  options.use_180_degree_flip_snap = true;
+  EXPECT_TRUE(RunRotationAveraging(
+      options, pose_graph, reconstruction, data.pose_priors));
+  EXPECT_EQ(reconstruction.NumRegFrames(),
+            data.gt_reconstruction.NumRegFrames());
+  EXPECT_EQ(NumValidEdges(pose_graph), NumValidEdges(data.pose_graph));
+  ExpectEqualRotations(
+      data.gt_reconstruction, reconstruction, /*max_rotation_error_deg=*/1e-2);
+}
+
+TEST(RotationAveraging, FlipSnapNoOpOnConsistentGraph) {
+  SyntheticDatasetOptions synthetic_dataset_options;
+  synthetic_dataset_options.num_rigs = 1;
+  synthetic_dataset_options.num_cameras_per_rig = 1;
+  synthetic_dataset_options.num_frames_per_rig = 5;
+  synthetic_dataset_options.num_points3D = 50;
+  synthetic_dataset_options.sensor_from_rig_rotation_stddev = 20.;
+  synthetic_dataset_options.prior_gravity = true;
+  synthetic_dataset_options.two_view_geometry_has_relative_pose = true;
+  auto data = CreateTestData(synthetic_dataset_options);
+
+  for (const bool use_gravity : {true, false}) {
+    Reconstruction reconstruction = data.reconstruction;
+    PoseGraph pose_graph = data.pose_graph;
+    RotationEstimatorOptions options = CreateRATestOptions(use_gravity);
+    options.use_180_degree_flip_snap = true;
+    EXPECT_TRUE(RunRotationAveraging(
+        options, pose_graph, reconstruction, data.pose_priors));
+    EXPECT_EQ(NumValidEdges(pose_graph), NumValidEdges(data.pose_graph));
+    ExpectEqualRotations(data.gt_reconstruction,
+                         reconstruction,
+                         /*max_rotation_error_deg=*/1e-2);
   }
 }
 

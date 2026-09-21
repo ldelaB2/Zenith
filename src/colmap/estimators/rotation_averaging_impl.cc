@@ -15,6 +15,10 @@
 namespace colmap {
 namespace {
 
+// 180 degree rotation about the camera optical (z) axis, used to evaluate the
+// yaw-flipped hypothesis of a relative rotation measurement.
+const Eigen::Matrix3d kRzPi = Eigen::Vector3d(-1, -1, 1).asDiagonal();
+
 // Computes the 1-DOF residual for gravity-aligned rotation constraints.
 // Returns (angle_2 - angle_1) - angle_12, wrapped to [-π, π] with jitter
 // near boundaries to avoid local minima.
@@ -100,6 +104,21 @@ RotationAveragingProblem::RotationAveragingProblem(
   const size_t num_params = AllocateParameters(reconstruction);
   BuildPairConstraints(pose_graph, reconstruction);
   BuildConstraintMatrix(num_params, pose_graph, reconstruction);
+
+  if (options_.use_180_degree_flip_snap) {
+    // Deterministic frame order and per-frame constraint lists for
+    // SnapFlippedFrames.
+    snap_frame_ids_.assign(active_frame_ids_.begin(), active_frame_ids_.end());
+    std::sort(snap_frame_ids_.begin(), snap_frame_ids_.end());
+    for (const auto& [pair_id, constraint] : pair_constraints_) {
+      const frame_t frame_id1 = image_id_to_frame_id_.at(constraint.image_id1);
+      const frame_t frame_id2 = image_id_to_frame_id_.at(constraint.image_id2);
+      frame_to_pair_ids_[frame_id1].push_back(pair_id);
+      if (frame_id2 != frame_id1) {
+        frame_to_pair_ids_[frame_id2].push_back(pair_id);
+      }
+    }
+  }
 }
 
 bool RotationAveragingProblem::HasFrameGravity(frame_t frame_id) const {
@@ -275,6 +294,17 @@ void RotationAveragingProblem::BuildPairConstraints(
          cam1_from_rig1.value_or(Rigid3d()).rotation())
             .toRotationMatrix();
 
+    // Yaw-flipped hypothesis of the measurement. The flip is applied about the
+    // optical axis of cam2 before gravity alignment, which changes the frame
+    // the stored matrix is expressed in.
+    std::optional<Eigen::Matrix3d> R_cam2_from_cam1_flipped;
+    if (options_.use_180_degree_flip_snap) {
+      R_cam2_from_cam1_flipped =
+          cam2_from_rig2.value_or(Rigid3d()).rotation().inverse() * kRzPi *
+          edge.cam2_from_cam1.rotation() *
+          cam1_from_rig1.value_or(Rigid3d()).rotation();
+    }
+
     const Eigen::Vector3d* frame_gravity1 =
         GetFrameGravityOrNull(frame_to_pose_prior_, frame1.FrameId());
     const Eigen::Vector3d* frame_gravity2 =
@@ -283,12 +313,22 @@ void RotationAveragingProblem::BuildPairConstraints(
     // Apply gravity alignment transformations if available.
     if (options_.use_gravity) {
       if (frame_gravity1 != nullptr) {
-        R_cam2_from_cam1 =
-            R_cam2_from_cam1 * GravityAlignedRotation(*frame_gravity1);
+        const Eigen::Matrix3d gravity_aligned1 =
+            GravityAlignedRotation(*frame_gravity1);
+        R_cam2_from_cam1 = R_cam2_from_cam1 * gravity_aligned1;
+        if (R_cam2_from_cam1_flipped) {
+          *R_cam2_from_cam1_flipped =
+              *R_cam2_from_cam1_flipped * gravity_aligned1;
+        }
       }
       if (frame_gravity2 != nullptr) {
-        R_cam2_from_cam1 = GravityAlignedRotation(*frame_gravity2).transpose() *
-                           R_cam2_from_cam1;
+        const Eigen::Matrix3d gravity_aligned2_inv =
+            GravityAlignedRotation(*frame_gravity2).transpose();
+        R_cam2_from_cam1 = gravity_aligned2_inv * R_cam2_from_cam1;
+        if (R_cam2_from_cam1_flipped) {
+          *R_cam2_from_cam1_flipped =
+              gravity_aligned2_inv * *R_cam2_from_cam1_flipped;
+        }
       }
     }
 
@@ -305,7 +345,8 @@ void RotationAveragingProblem::BuildPairConstraints(
           GravityAligned1DOF{aa[1], aa[0] * aa[0] + aa[2] * aa[2]};
     } else {
       // General case: use 3-DOF constraint.
-      constraint.constraint = Full3DOF{R_cam2_from_cam1};
+      constraint.constraint =
+          Full3DOF{R_cam2_from_cam1, R_cam2_from_cam1_flipped};
     }
   }
 
@@ -498,70 +539,109 @@ Eigen::VectorXd RotationAveragingProblem::WeightedResiduals() const {
   return residuals_;
 }
 
-void RotationAveragingProblem::ComputeResiduals() {
+Eigen::Vector3d RotationAveragingProblem::ComputeConstraintResidual(
+    const PairConstraint& constraint, bool use_flipped_measurement) const {
+  const frame_t frame_id1 = image_id_to_frame_id_.at(constraint.image_id1);
+  const frame_t frame_id2 = image_id_to_frame_id_.at(constraint.image_id2);
+  const int frame_param_idx1 = frame_id_to_param_idx_.at(frame_id1);
+  const int frame_param_idx2 = frame_id_to_param_idx_.at(frame_id2);
+
+  if (const auto* constraint_1dof =
+          std::get_if<GravityAligned1DOF>(&constraint.constraint)) {
+    // 1-DOF case: compute Y-axis angle residual. For gravity-aligned frames
+    // the yaw axis is the gravity axis, which for nadir cameras coincides with
+    // the optical axis, so the flipped measurement is a π offset of the angle.
+    const double angle_cam2_from_cam1 =
+        constraint_1dof->angle_cam2_from_cam1 +
+        (use_flipped_measurement ? EIGEN_PI : 0.0);
+    const double residual = ComputeGravityAligned1DOFResidual(
+        angle_cam2_from_cam1,
+        estimated_rotations_[frame_param_idx1],
+        estimated_rotations_[frame_param_idx2]);
+    return Eigen::Vector3d(residual, 0, 0);
+  }
+
+  const auto* full = std::get_if<Full3DOF>(&constraint.constraint);
+  THROW_CHECK(full != nullptr) << "Unknown constraint type";
+
+  // 3-DOF case: compute full rotation error.
+  Eigen::Matrix3d estimated_cam1_from_world, estimated_cam2_from_world;
+
+  const Eigen::Vector3d* frame_gravity1 =
+      GetFrameGravityOrNull(frame_to_pose_prior_, frame_id1);
+  const Eigen::Vector3d* frame_gravity2 =
+      GetFrameGravityOrNull(frame_to_pose_prior_, frame_id2);
+
+  if (options_.use_gravity && frame_gravity1 != nullptr) {
+    estimated_cam1_from_world =
+        RotationFromYAxisAngle(estimated_rotations_[frame_param_idx1]);
+  } else {
+    estimated_cam1_from_world = AngleAxisToRotationMatrix(
+        estimated_rotations_.segment<3>(frame_param_idx1));
+  }
+
+  if (options_.use_gravity && frame_gravity2 != nullptr) {
+    estimated_cam2_from_world =
+        RotationFromYAxisAngle(estimated_rotations_[frame_param_idx2]);
+  } else {
+    estimated_cam2_from_world = AngleAxisToRotationMatrix(
+        estimated_rotations_.segment<3>(frame_param_idx2));
+  }
+
+  if (constraint.cam1_from_rig_param_idx != -1) {
+    estimated_cam1_from_world =
+        AngleAxisToRotationMatrix(estimated_rotations_.segment<3>(
+            constraint.cam1_from_rig_param_idx)) *
+        estimated_cam1_from_world;
+  }
+  if (constraint.cam2_from_rig_param_idx != -1) {
+    estimated_cam2_from_world =
+        AngleAxisToRotationMatrix(estimated_rotations_.segment<3>(
+            constraint.cam2_from_rig_param_idx)) *
+        estimated_cam2_from_world;
+  }
+
+  if (use_flipped_measurement) {
+    THROW_CHECK(full->R_cam2_from_cam1_flipped.has_value());
+  }
+  const Eigen::Matrix3d& R_cam2_from_cam1 =
+      use_flipped_measurement ? *full->R_cam2_from_cam1_flipped
+                              : full->R_cam2_from_cam1;
+  return -RotationMatrixToAngleAxis(estimated_cam2_from_world.transpose() *
+                                    R_cam2_from_cam1 *
+                                    estimated_cam1_from_world);
+}
+
+void RotationAveragingProblem::ComputeResiduals(bool snap_180_degree_flips) {
   // Set PRNG seed for deterministic jitter injection.
   if (options_.random_seed >= 0) {
     SetPRNGSeed(static_cast<unsigned>(options_.random_seed));
   }
 
+  snap_180_degree_flips =
+      snap_180_degree_flips && options_.use_180_degree_flip_snap;
+  num_snapped_constraints_ = 0;
+
   for (const auto& [pair_id, constraint] : pair_constraints_) {
-    const frame_t frame_id1 = image_id_to_frame_id_.at(constraint.image_id1);
-    const frame_t frame_id2 = image_id_to_frame_id_.at(constraint.image_id2);
-    const int frame_param_idx1 = frame_id_to_param_idx_.at(frame_id1);
-    const int frame_param_idx2 = frame_id_to_param_idx_.at(frame_id2);
+    Eigen::Vector3d residual = ComputeConstraintResidual(
+        constraint, /*use_flipped_measurement=*/false);
 
-    if (const auto* constraint_1dof =
-            std::get_if<GravityAligned1DOF>(&constraint.constraint)) {
-      // 1-DOF case: compute Y-axis angle residual.
-      residuals_[constraint.row_index] = ComputeGravityAligned1DOFResidual(
-          constraint_1dof->angle_cam2_from_cam1,
-          estimated_rotations_[frame_param_idx1],
-          estimated_rotations_[frame_param_idx2]);
-    } else if (const auto* full =
-                   std::get_if<Full3DOF>(&constraint.constraint)) {
-      // 3-DOF case: compute full rotation error.
-
-      Eigen::Matrix3d estimated_cam1_from_world, estimated_cam2_from_world;
-
-      const Eigen::Vector3d* frame_gravity1 =
-          GetFrameGravityOrNull(frame_to_pose_prior_, frame_id1);
-      const Eigen::Vector3d* frame_gravity2 =
-          GetFrameGravityOrNull(frame_to_pose_prior_, frame_id2);
-
-      if (options_.use_gravity && frame_gravity1 != nullptr) {
-        estimated_cam1_from_world =
-            RotationFromYAxisAngle(estimated_rotations_[frame_param_idx1]);
-      } else {
-        estimated_cam1_from_world = AngleAxisToRotationMatrix(
-            estimated_rotations_.segment<3>(frame_param_idx1));
+    // Snap to the yaw-flipped hypothesis if it is closer to the current
+    // estimate, so that a 180 degree flipped measurement yields a small
+    // residual instead of one at the cut locus.
+    if (snap_180_degree_flips) {
+      const Eigen::Vector3d residual_flipped = ComputeConstraintResidual(
+          constraint, /*use_flipped_measurement=*/true);
+      if (residual_flipped.squaredNorm() < residual.squaredNorm()) {
+        residual = residual_flipped;
+        ++num_snapped_constraints_;
       }
+    }
 
-      if (options_.use_gravity && frame_gravity2 != nullptr) {
-        estimated_cam2_from_world =
-            RotationFromYAxisAngle(estimated_rotations_[frame_param_idx2]);
-      } else {
-        estimated_cam2_from_world = AngleAxisToRotationMatrix(
-            estimated_rotations_.segment<3>(frame_param_idx2));
-      }
-
-      if (constraint.cam1_from_rig_param_idx != -1) {
-        estimated_cam1_from_world =
-            AngleAxisToRotationMatrix(estimated_rotations_.segment<3>(
-                constraint.cam1_from_rig_param_idx)) *
-            estimated_cam1_from_world;
-      }
-      if (constraint.cam2_from_rig_param_idx != -1) {
-        estimated_cam2_from_world =
-            AngleAxisToRotationMatrix(estimated_rotations_.segment<3>(
-                constraint.cam2_from_rig_param_idx)) *
-            estimated_cam2_from_world;
-      }
-
-      residuals_.segment<3>(constraint.row_index) = -RotationMatrixToAngleAxis(
-          estimated_cam2_from_world.transpose() * full->R_cam2_from_cam1 *
-          estimated_cam1_from_world);
+    if (std::holds_alternative<GravityAligned1DOF>(constraint.constraint)) {
+      residuals_[constraint.row_index] = residual[0];
     } else {
-      LOG(FATAL) << "Unknown constraint type";
+      residuals_.segment<3>(constraint.row_index) = residual;
     }
   }
 
@@ -576,6 +656,57 @@ void RotationAveragingProblem::ComputeResiduals() {
         AngleAxisToRotationMatrix(
             estimated_rotations_.segment<3>(fixed_frame_param_idx)));
   }
+}
+
+void RotationAveragingProblem::FlipFrameState(frame_t frame_id) {
+  const int frame_param_idx = frame_id_to_param_idx_.at(frame_id);
+  if (HasFrameGravity(frame_id)) {
+    estimated_rotations_[frame_param_idx] += EIGEN_PI;
+  } else {
+    // Rotate rig_from_world by 180 degrees about the rig's z-axis.
+    estimated_rotations_.segment<3>(frame_param_idx) =
+        RotationMatrixToAngleAxis(kRzPi * AngleAxisToRotationMatrix(
+                                              estimated_rotations_.segment<3>(
+                                                  frame_param_idx)));
+  }
+}
+
+int RotationAveragingProblem::SnapFlippedFrames() {
+  THROW_CHECK(options_.use_180_degree_flip_snap);
+  if (options_.random_seed >= 0) {
+    SetPRNGSeed(static_cast<unsigned>(options_.random_seed));
+  }
+
+  const auto sum_residual_norms =
+      [&](const std::vector<image_pair_t>& pair_ids) {
+    double sum = 0;
+    for (const image_pair_t pair_id : pair_ids) {
+      sum += ComputeConstraintResidual(pair_constraints_.at(pair_id),
+                                       /*use_flipped_measurement=*/false)
+                 .norm();
+    }
+    return sum;
+  };
+
+  // Frames are visited sequentially so that a flipped frame immediately
+  // informs the decision of its neighbors (Gauss-Seidel style). The gauge
+  // fixing frame defines the yaw basin and is never flipped.
+  int num_flipped = 0;
+  for (const frame_t frame_id : snap_frame_ids_) {
+    if (frame_id == fixed_frame_id_) continue;
+    const auto it = frame_to_pair_ids_.find(frame_id);
+    if (it == frame_to_pair_ids_.end()) continue;
+
+    const double norm_orig = sum_residual_norms(it->second);
+    FlipFrameState(frame_id);
+    const double norm_flipped = sum_residual_norms(it->second);
+    if (norm_flipped < norm_orig) {
+      ++num_flipped;
+    } else {
+      FlipFrameState(frame_id);  // Undo.
+    }
+  }
+  return num_flipped;
 }
 
 void RotationAveragingProblem::UpdateState(const Eigen::VectorXd& step) {
@@ -851,10 +982,18 @@ bool RotationAveragingSolver::SolveIRLS(RotationAveragingProblem& problem) {
   Eigen::SparseMatrix<double> at_weight_a;
   Eigen::VectorXd step(problem.NumParameters());
 
+  int num_flipped_frames = 0;
   int iteration = 0;
   for (iteration = 0; iteration < options_.max_num_irls_iterations;
        iteration++) {
-    problem.ComputeResiduals();
+    // The 180 degree flip snapping is only applied in this stage, after the
+    // L1 stage has settled the global solution on the raw measurements. First
+    // flip frames whose current orientation disagrees with the majority of
+    // their constraints, then evaluate residuals with per-constraint snapping.
+    if (options_.use_180_degree_flip_snap) {
+      num_flipped_frames += problem.SnapFlippedFrames();
+    }
+    problem.ComputeResiduals(options_.use_180_degree_flip_snap);
 
     auto weights_irls = ComputeIRLSWeights(problem, sigma);
     if (!weights_irls) {
@@ -899,6 +1038,15 @@ bool RotationAveragingSolver::SolveIRLS(RotationAveragingProblem& problem) {
     }
   }
   VLOG(2) << "IRLS total iteration: " << iteration;
+
+  if (options_.use_180_degree_flip_snap) {
+    LOG(INFO) << "180 degree flip snapping: flipped " << num_flipped_frames
+              << " frame orientations over " << iteration
+              << " IRLS iterations; " << problem.NumSnappedConstraints()
+              << " / " << problem.PairConstraints().size()
+              << " relative rotations snapped to their flipped hypothesis in "
+                 "the last iteration";
+  }
 
   return true;
 }

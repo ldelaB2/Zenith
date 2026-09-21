@@ -289,6 +289,10 @@ bool RunRotationAveragingOnComponent(
     return false;
   }
 
+  if (options.use_180_degree_flip_snap) {
+    LOG(INFO) << "Rotation averaging with 180 degree flip snapping enabled";
+  }
+
   if (!HasUnknownCamsFromRig(reconstruction)) {
     pose_graph.InvalidatePairsOutsideActiveImageIds(active_image_ids);
 
